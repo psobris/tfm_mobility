@@ -1,0 +1,23 @@
+# Archivos compilados y temporales de Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Paquetes y distribuciones (wheels)
+dist/
+build/
+*.egg-info/
+src/*.egg-info/
+
+# Archivos temporales de Word/Office
+~$*.docx
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Configuración de IDEs
+.vscode/
+.idea/
