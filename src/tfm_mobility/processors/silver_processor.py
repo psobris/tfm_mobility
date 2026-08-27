@@ -7,12 +7,26 @@ from delta.tables import DeltaTable
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+
 class SilverProcessor:
-    """Procesador para la capa Silver: Limpieza, tipado, normalización y desanidado."""
+    """Procesador para la capa Silver: Limpieza, tipado, normalización, desanidado y filtrado territorial."""
+
+    # Bounding Box: España completa (Península, Canarias, Baleares, Ceuta, Melilla) + Búfer Fronterizo
+    LAT_MIN = 27.0
+    LAT_MAX = 44.0
+    LON_MIN = -18.5
+    LON_MAX = 5.0
 
     def __init__(self, spark: SparkSession):
         self.spark = spark
         self.spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+
+    def _filter_spain_with_buffer(self, df: DataFrame, lat_col: str = "latitude", lon_col: str = "longitude") -> DataFrame:
+        """Aplica un filtro geográfico para mantener solo el territorio español y zonas limítrofes."""
+        return df.filter(
+            (F.col(lat_col) >= self.LAT_MIN) & (F.col(lat_col) <= self.LAT_MAX) &
+            (F.col(lon_col) >= self.LON_MIN) & (F.col(lon_col) <= self.LON_MAX)
+        )
 
     def _save_to_silver(self, df: DataFrame, table_name: str, primary_keys: List[str]) -> None:
         if df is None or df.rdd.isEmpty():
@@ -94,7 +108,8 @@ class SilverProcessor:
                 F.col("ingestion_timestamp")
             )
 
-            self._save_to_silver(weather_silver_df, "silver_weather", ["latitude", "longitude", "forecast_timestamp"])
+            weather_filtered_df = self._filter_spain_with_buffer(weather_silver_df)
+            self._save_to_silver(weather_filtered_df, "silver_weather", ["latitude", "longitude", "forecast_timestamp"])
         except Exception as e:
             logging.error(f"❌ Error procesando 'silver_weather': {e}")
             raise e
@@ -133,7 +148,8 @@ class SilverProcessor:
                 F.col("ingestion_timestamp")
             )
 
-            self._save_to_silver(silver_fires_df, "silver_nasa_fires", ["latitude", "longitude", "acq_date", "acq_time"])
+            fires_filtered_df = self._filter_spain_with_buffer(silver_fires_df)
+            self._save_to_silver(fires_filtered_df, "silver_nasa_fires", ["latitude", "longitude", "acq_date", "acq_time"])
         except Exception as e:
             logging.error(f"❌ Error procesando 'silver_nasa_fires': {e}")
             raise e
@@ -163,7 +179,8 @@ class SilverProcessor:
                 F.col("ingestion_timestamp")
             ).filter(F.col("record_id").isNotNull())
 
-            self._save_to_silver(silver_dgt_df, "silver_dgt_traffic", ["record_id"])
+            dgt_filtered_df = self._filter_spain_with_buffer(silver_dgt_df)
+            self._save_to_silver(dgt_filtered_df, "silver_dgt_traffic", ["record_id"])
         except Exception as e:
             logging.error(f"❌ Error procesando 'silver_dgt_traffic': {e}")
             raise e
