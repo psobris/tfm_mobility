@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfm_mobility"
-version = "0.15.0"
+version = "0.16.4"
 authors = [
   { name="Paula Sobrados Risco", email="pasobrad@ucm.es" },
 ]

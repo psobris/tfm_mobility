@@ -4,8 +4,10 @@ import logging
 from typing import List
 from delta.tables import DeltaTable
 from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import functions as F
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 
 class BronzeProcessor:
     """Procesador para la capa Bronze con sanitización de esquemas y Delta MERGE condicional."""
@@ -39,6 +41,10 @@ class BronzeProcessor:
         if raw_df is None or raw_df.rdd.isEmpty():
             logging.warning(f"⚠️ El DataFrame de origen para {table_name} está vacío. Cancelando MERGE.")
             return
+
+        # Desanidar array de lotes si proviene de la ingesta por lotes de meteorología
+        if "element" in raw_df.columns:
+            raw_df = raw_df.select(F.col("element.*"))
 
         raw_df = self._sanitize_column_names(raw_df)
         
@@ -100,7 +106,7 @@ class BronzeProcessor:
         sources = [
             ("Files/raw/realtime/dgt_traffic", "bronze_dgt_traffic", ["record_id"]),
             ("Files/raw/realtime/nasa_nrt", "bronze_nasa_nrt", ["latitude", "longitude", "acq_date", "acq_time"]),
-            ("Files/raw/realtime/weather", "bronze_weather", ["latitude", "longitude", "generationtime_ms"])
+            ("Files/raw/realtime/weather", "bronze_weather", ["latitude", "longitude"])
         ]
 
         for raw_path, table_name, pk in sources:

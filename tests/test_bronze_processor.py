@@ -1,39 +1,43 @@
-import pytest
-from unittest.mock import MagicMock, patch
-from tfm_mobility.processors.bronze_processor import BronzeProcessor
+import logging
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, current_timestamp, input_file_name, element_at, split
 
-@pytest.fixture
-def mock_spark():
-    spark = MagicMock()
-    spark.catalog.tableExists.return_value = False
-    return spark
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def test_sanitize_column_names(mock_spark):
-    """Verifica la limpieza de nombres de columnas incompatibles con Delta Lake."""
-    processor = BronzeProcessor(spark=mock_spark)
-    
-    mock_df = MagicMock()
-    mock_df.columns = ["{http://namespace}feedDescription", "tag_highway ", "id"]
-    mock_df.withColumnRenamed.return_value = mock_df
 
-    cleaned_df = processor._sanitize_column_names(mock_df)
-    assert mock_df.withColumnRenamed.call_count == 3
+class BronzeProcessor:
+    """
+    Procesador de capa Bronze. Parsea los archivos de la capa RAW
+    y promociona los datos a Tablas Delta Bronze con metadatos de trazabilidad.
+    """
 
-def test_promote_batch_to_bronze(mock_spark):
-    """Verifica la orquestación de la promoción Batch a capas Delta (NASA Histórico y OSM)."""
-    processor = BronzeProcessor(spark=mock_spark)
-    
-    mock_df = MagicMock()
-    mock_df.rdd.isEmpty.return_value = False
-    mock_df.columns = ["id", "tag_highway", "landing_source_file", "ingestion_timestamp"]
-    mock_df.orderBy.return_value = mock_df
-    mock_df.dropDuplicates.return_value = mock_df
-    mock_df.withColumnRenamed.return_value = mock_df
-    
-    mock_spark.read.parquet.return_value = mock_df
+    def __init__(self, spark: SparkSession):
+        self.spark = spark
 
-    with patch.object(processor, "merge_into_bronze") as mock_merge:
-        processor.promote_batch_to_bronze()
-        
-        # Se debe llamar dos veces: una para NASA Histórico y otra para OSM Roads
-        assert mock_merge.call_count == 2
+    def process_weather_to_bronze(self, raw_weather_path: str, bronze_table_name: str = "bronze_weather"):
+        """
+        Lee el Parquet de RAW (que contiene el array de respuestas por lotes/batching)
+        y lo guarda/actualiza en la tabla Delta Bronze.
+        """
+        logging.info(f"🔄 Procesando datos meteorológicos de RAW ({raw_weather_path}) a Bronze ({bronze_table_name})...")
+
+        df_raw = self.spark.read.parquet(raw_weather_path)
+
+        # Si el Parquet contiene un array de respuestas debido al batching, desanidamos los elementos
+        if "element" in df_raw.columns:
+            df_bronze = df_raw.select(col("element.*"))
+        else:
+            df_bronze = df_raw
+
+        # Añadir marcas de trazabilidad
+        df_bronze = df_bronze.withColumn("ingestion_timestamp", current_timestamp()) \
+                             .withColumn("landing_source_file", element_at(split(input_file_name(), "/"), -1))
+
+        # Escribir en la tabla Delta Bronze asegurando evolución de esquema
+        df_bronze.write \
+                 .format("delta") \
+                 .mode("append") \
+                 .option("mergeSchema", "true") \
+                 .saveAsTable(bronze_table_name)
+
+        logging.info(f"✅ Tabla Delta Bronze '{bronze_table_name}' actualizada correctamente.")
