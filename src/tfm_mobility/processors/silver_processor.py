@@ -2,16 +2,15 @@ import logging
 from typing import List
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, IntegerType, TimestampType, DateType
+from pyspark.sql.types import DoubleType, IntegerType, DateType
 from delta.tables import DeltaTable
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
 class SilverProcessor:
-    """Procesador para la capa Silver: Limpieza, tipado, normalización, desanidado y filtrado territorial."""
+    """Procesador para la capa Silver: Limpieza, tipado, normalización y filtrado territorial."""
 
-    # Bounding Box: España completa (Península, Canarias, Baleares, Ceuta, Melilla) + Búfer Fronterizo
     LAT_MIN = 27.0
     LAT_MAX = 44.0
     LON_MIN = -18.5
@@ -22,7 +21,6 @@ class SilverProcessor:
         self.spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
 
     def _filter_spain_with_buffer(self, df: DataFrame, lat_col: str = "latitude", lon_col: str = "longitude") -> DataFrame:
-        """Aplica un filtro geográfico para mantener solo el territorio español y zonas limítrofes."""
         return df.filter(
             (F.col(lat_col) >= self.LAT_MIN) & (F.col(lat_col) <= self.LAT_MAX) &
             (F.col(lon_col) >= self.LON_MIN) & (F.col(lon_col) <= self.LON_MAX)
@@ -69,16 +67,16 @@ class SilverProcessor:
                 "CAST(NULL AS STRING) AS updated_source_file",
                 "CAST(NULL AS TIMESTAMP) AS updated_timestamp"
             )
-            initial_df.write \
-                .format("delta") \
-                .mode("overwrite") \
-                .option("overwriteSchema", "true") \
-                .saveAsTable(table_name)
+            initial_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(table_name)
             logging.info(f"✨ Tabla Silver Delta '{table_name}' creada por primera vez.")
 
     def process_silver_weather(self) -> None:
         try:
+            # Refrescar catálogo para garantizar lectura en tiempo de ejecución en canalizaciones
+            self.spark.catalog.refreshTable("bronze_weather")
             raw_df = self.spark.table("bronze_weather")
+
+            # Aplanado analítico desde el struct 'hourly' de Bronze
             exploded_df = raw_df.select(
                 F.col("latitude"),
                 F.col("longitude"),
@@ -86,11 +84,9 @@ class SilverProcessor:
                 F.col("timezone"),
                 F.col("landing_source_file"),
                 F.col("ingestion_timestamp"),
-                F.col("hourly"),
-                F.posexplode(F.col("hourly.time")).alias("pos", "forecast_time_str")
-            )
-
-            weather_silver_df = exploded_df.select(
+                F.posexplode(F.col("hourly.time")).alias("pos", "forecast_time_str"),
+                F.col("hourly")
+            ).select(
                 F.col("latitude").cast(DoubleType()),
                 F.col("longitude").cast(DoubleType()),
                 F.col("elevation").cast(DoubleType()),
@@ -99,16 +95,12 @@ class SilverProcessor:
                 F.element_at(F.col("hourly.temperature_2m"), F.col("pos") + 1).cast(DoubleType()).alias("temperature_celsius"),
                 F.element_at(F.col("hourly.relative_humidity_2m"), F.col("pos") + 1).cast(IntegerType()).alias("humidity_percentage"),
                 F.element_at(F.col("hourly.precipitation"), F.col("pos") + 1).cast(DoubleType()).alias("precipitation_mm"),
-                F.element_at(F.col("hourly.rain"), F.col("pos") + 1).cast(DoubleType()).alias("rain_mm"),
-                F.element_at(F.col("hourly.showers"), F.col("pos") + 1).cast(DoubleType()).alias("showers_mm"),
-                F.element_at(F.col("hourly.snowfall"), F.col("pos") + 1).cast(DoubleType()).alias("snowfall_cm"),
                 F.element_at(F.col("hourly.wind_speed_10m"), F.col("pos") + 1).cast(DoubleType()).alias("wind_speed_kmh"),
-                F.element_at(F.col("hourly.wind_gusts_10m"), F.col("pos") + 1).cast(DoubleType()).alias("wind_gusts_kmh"),
                 F.col("landing_source_file"),
                 F.col("ingestion_timestamp")
             )
 
-            weather_filtered_df = self._filter_spain_with_buffer(weather_silver_df)
+            weather_filtered_df = self._filter_spain_with_buffer(exploded_df)
             self._save_to_silver(weather_filtered_df, "silver_weather", ["latitude", "longitude", "forecast_timestamp"])
         except Exception as e:
             logging.error(f"❌ Error procesando 'silver_weather': {e}")

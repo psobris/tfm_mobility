@@ -39,15 +39,10 @@ class BronzeProcessor:
 
     def merge_into_bronze(self, raw_df: DataFrame, table_name: str, primary_keys: List[str]) -> None:
         if raw_df is None or raw_df.rdd.isEmpty():
-            logging.warning(f"⚠️ El DataFrame de origen para {table_name} está vacío. Cancelando MERGE.")
+            logging.warning(f"⚠️ El DataFrame para {table_name} está vacío. Cancelando MERGE.")
             return
 
-        # Desanidar array de lotes si proviene de la ingesta por lotes de meteorología
-        if "element" in raw_df.columns:
-            raw_df = raw_df.select(F.col("element.*"))
-
         raw_df = self._sanitize_column_names(raw_df)
-        
         sanitized_pks = [re.sub(r'_+', '_', re.sub(r'[{}:;()\s\t=/\\]', '_', pk)).strip('_') for pk in primary_keys]
         sanitized_pks = [pk for pk in sanitized_pks if pk in raw_df.columns]
 
@@ -66,10 +61,7 @@ class BronzeProcessor:
             meta_cols = {"landing_source_file", "ingestion_timestamp", "updated_source_file", "updated_timestamp"}
             data_cols = [c for c in dedup_raw_df.columns if c not in sanitized_pks and c not in meta_cols]
 
-            if data_cols:
-                update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in data_cols])
-            else:
-                update_condition = "1 = 0"
+            update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in data_cols]) if data_cols else "1 = 0"
 
             insert_values = {col: f"source.{col}" for col in dedup_raw_df.columns if col not in ["updated_source_file", "updated_timestamp"]}
             insert_values["updated_source_file"] = "CAST(NULL AS STRING)"
@@ -86,7 +78,6 @@ class BronzeProcessor:
                 .whenMatchedUpdate(condition=update_condition, set=update_values) \
                 .whenNotMatchedInsert(values=insert_values) \
                 .execute()
-                
             logging.info(f"✅ MERGE condicional completado en '{table_name}'.")
         else:
             initial_df = dedup_raw_df.selectExpr(
@@ -94,28 +85,46 @@ class BronzeProcessor:
                 "CAST(NULL AS STRING) AS updated_source_file",
                 "CAST(NULL AS TIMESTAMP) AS updated_timestamp"
             )
-            
-            initial_df.write \
-                .format("delta") \
-                .mode("overwrite") \
-                .option("overwriteSchema", "true") \
-                .saveAsTable(table_name)
+            initial_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(table_name)
             logging.info(f"✨ Tabla Delta '{table_name}' creada por primera vez.")
 
+    def process_bronze_weather(self, raw_path: str = "Files/raw/realtime/weather") -> None:
+        clean_path = self._resolve_fabric_path(raw_path)
+        logging.info(f"⚙️ Procesando 'bronze_weather' manteniendo estructura nativa desde: {clean_path}")
+
+        try:
+            df_raw = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
+            
+            # Mantener objeto 'hourly' nativo (fidelidad de origen)
+            df_bronze = df_raw.select(
+                F.col("latitude"),
+                F.col("longitude"),
+                F.col("elevation"),
+                F.col("timezone"),
+                F.col("hourly"),
+                F.col("landing_source_file"),
+                F.col("ingestion_timestamp")
+            )
+
+            self.merge_into_bronze(df_bronze, "bronze_weather", ["latitude", "longitude"])
+        except Exception as e:
+            logging.error(f"❌ Error al procesar 'bronze_weather': {e}")
+
     def promote_realtime_to_bronze(self) -> None:
+        self.process_bronze_weather("Files/raw/realtime/weather")
+
         sources = [
             ("Files/raw/realtime/dgt_traffic", "bronze_dgt_traffic", ["record_id"]),
-            ("Files/raw/realtime/nasa_nrt", "bronze_nasa_nrt", ["latitude", "longitude", "acq_date", "acq_time"]),
-            ("Files/raw/realtime/weather", "bronze_weather", ["latitude", "longitude"])
+            ("Files/raw/realtime/nasa_nrt", "bronze_nasa_nrt", ["latitude", "longitude", "acq_date", "acq_time"])
         ]
 
         for raw_path, table_name, pk in sources:
             clean_path = self._resolve_fabric_path(raw_path)
             try:
-                raw_df = self.spark.read.parquet(clean_path)
+                raw_df = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
                 self.merge_into_bronze(raw_df, table_name, pk)
             except Exception as e:
-                logging.error(f"❌ Error al procesar {table_name} desde {clean_path}: {e}")
+                logging.error(f"❌ Error procesando {table_name}: {e}")
 
     def promote_batch_to_bronze(self) -> None:
         sources = [
@@ -126,7 +135,7 @@ class BronzeProcessor:
         for raw_path, table_name, pk in sources:
             clean_path = self._resolve_fabric_path(raw_path)
             try:
-                raw_df = self.spark.read.parquet(clean_path)
+                raw_df = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
                 self.merge_into_bronze(raw_df, table_name, pk)
             except Exception as e:
-                logging.error(f"❌ Error al procesar {table_name} desde {clean_path}: {e}")
+                logging.error(f"❌ Error procesando {table_name}: {e}")

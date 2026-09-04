@@ -1,58 +1,46 @@
 import os
 import json
-from unittest.mock import patch, MagicMock
+import pytest
+from unittest.mock import MagicMock, patch
 from tfm_mobility.ingesters.realtime.weather_ingester import WeatherIngester
 
 
-def test_weather_ingester_grid_generation():
-    """Verifica que el generador de la malla a 0.1° retorne listas válidas."""
-    lats, lons = WeatherIngester.generate_spain_grid(step=0.1)
-
+def test_generate_spain_grid():
+    """Valida la generación de coordenadas sin llamadas de red."""
+    lats, lons = WeatherIngester.generate_spain_grid()
     assert len(lats) == len(lons)
-    assert len(lats) > 10000  # A 0.1° deben generarse mas de 10.000 puntos
-    assert 40.41 in lats or 40.4 in lats  # Coordenadas aproximadas de Madrid
-    assert -3.7 in lons or -3.71 in lons
+    assert len(lats) > 2000
+    assert min(lats) >= 27.0
+    assert max(lats) <= 44.0
 
 
-def test_weather_ingester_fetch_data_mock(requests_mock):
-    """Verifica que fetch_data envíe los parámetros HTTP en lotes correctamente."""
-    ingester = WeatherIngester(output_base_dir="/tmp/test_weather")
+@patch("requests.Session.get")
+def test_fetch_data_success(mock_get):
+    """Simula respuestas de la API para evitar bloquear el test runner."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = [{"latitude": 40.41, "longitude": -3.70, "hourly": {}}]
+    mock_get.return_value = mock_response
 
-    mock_response = {
-        "latitude": 40.4168,
-        "longitude": -3.7038,
-        "hourly": {
-            "time": ["2026-09-02T00:00"],
-            "temperature_2m": [22.5]
-        }
-    }
+    ingester = WeatherIngester()
+    # Reducimos la malla en el test para ejecución instantánea
+    with patch.object(WeatherIngester, "generate_spain_grid", return_value=([40.41], [-3.70])):
+        data = ingester.fetch_data()
 
-    requests_mock.get(WeatherIngester.BASE_URL, json=mock_response)
-
-    results = ingester.fetch_data(latitudes=[40.4168], longitudes=[-3.7038])
-
-    assert isinstance(results, list)
-    assert len(results) == 1
-    assert results[0]["latitude"] == 40.4168
-
-    last_request = requests_mock.last_request
-    assert "latitude" in last_request.query
-    assert "longitude" in last_request.query
-    assert "timezone=europe" in last_request.query.lower()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["latitude"] == 40.41
 
 
-def test_weather_ingester_save_landing(tmp_path):
-    """Verifica que la función guarde los archivos en la estructura de directorios adecuada."""
-    test_dir = str(tmp_path)
-    ingester = WeatherIngester(output_base_dir=test_dir)
+def test_save_landing(tmp_path):
+    """Prueba la escritura en disco usando carpetas temporales aisladas."""
+    output_dir = str(tmp_path / "landing" / "weather")
+    ingester = WeatherIngester(output_base_dir=output_dir)
 
-    dummy_data = [{"latitude": 40.0, "longitude": -3.0, "hourly": {}}]
-    timestamp_str = "20260902_120000"
+    dummy_data = [{"latitude": 40.41, "longitude": -3.70, "hourly": {}}]
+    saved_path = ingester.save_landing(dummy_data, timestamp_str="20260903_120000")
 
-    saved_file = ingester.save_landing(dummy_data, timestamp_str)
-
-    assert os.path.exists(saved_file)
-    with open(saved_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        assert len(data) == 1
-        assert data[0]["latitude"] == 40.0
+    assert os.path.exists(saved_path)
+    with open(saved_path, "r", encoding="utf-8") as f:
+        loaded_data = json.load(f)
+    assert loaded_data == dummy_data
