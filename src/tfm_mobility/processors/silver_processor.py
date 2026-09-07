@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 class SilverProcessor:
-    """Procesador para la capa Silver: Limpieza, tipado, normalización y filtrado territorial."""
+    """Procesador para la capa Silver: Limpieza, tipado, normalización, clústeres espaciales y filtrado territorial."""
 
     LAT_MIN = 27.0
     LAT_MAX = 44.0
@@ -72,11 +72,9 @@ class SilverProcessor:
 
     def process_silver_weather(self) -> None:
         try:
-            # Refrescar catálogo para garantizar lectura en tiempo de ejecución en canalizaciones
             self.spark.catalog.refreshTable("bronze_weather")
             raw_df = self.spark.table("bronze_weather")
 
-            # Aplanado analítico desde el struct 'hourly' de Bronze
             exploded_df = raw_df.select(
                 F.col("latitude"),
                 F.col("longitude"),
@@ -142,8 +140,112 @@ class SilverProcessor:
 
             fires_filtered_df = self._filter_spain_with_buffer(silver_fires_df)
             self._save_to_silver(fires_filtered_df, "silver_nasa_fires", ["latitude", "longitude", "acq_date", "acq_time"])
+
+            # Procesar clústeres dinámicos
+            self.process_silver_fire_clusters()
+
         except Exception as e:
             logging.error(f"❌ Error procesando 'silver_nasa_fires': {e}")
+            raise e
+
+    def process_silver_fire_clusters(self) -> None:
+        """
+        Crea/actualiza la tabla 'silver_fire_clusters' ampliando sus límites (bounding box)
+        y asigna el 'cluster_id' a cada registro de 'silver_nasa_fires'.
+        """
+        try:
+            BUFFER_DEG = 0.045  # ~5 km en latitud/longitud
+            
+            if not self.spark.catalog.tableExists("silver_nasa_fires"):
+                logging.warning("⚠️ La tabla 'silver_nasa_fires' no existe para calcular clústeres.")
+                return
+
+            raw_fires_df = self.spark.table("silver_nasa_fires")
+            if raw_fires_df.rdd.isEmpty():
+                return
+
+            # 1. Crear la tabla de clústeres si no existe
+            if not self.spark.catalog.tableExists("silver_fire_clusters"):
+                initial_clusters = raw_fires_df.groupBy(
+                    F.round(F.col("latitude"), 2).alias("grid_lat"),
+                    F.round(F.col("longitude"), 2).alias("grid_lon")
+                ).agg(
+                    F.concat(F.lit("INC_"), F.format_string("%.2f", F.first("latitude")), F.lit("_"), F.format_string("%.2f", F.first("longitude"))).alias("cluster_id"),
+                    F.min("latitude").alias("lat_min"),
+                    F.max("latitude").alias("lat_max"),
+                    F.min("longitude").alias("lon_min"),
+                    F.max("longitude").alias("lon_max"),
+                    F.min("fire_detection_timestamp").alias("first_detection_timestamp"),
+                    F.max("fire_detection_timestamp").alias("last_detection_timestamp")
+                ).drop("grid_lat", "grid_lon")
+
+                initial_clusters.write.format("delta").mode("overwrite").saveAsTable("silver_fire_clusters")
+                logging.info("✨ Tabla 'silver_fire_clusters' creada por primera vez.")
+
+            # 2. Asignar cluster_id por proximidad a la bounding box ampliada
+            clusters_df = self.spark.table("silver_fire_clusters")
+
+            enriched_fires = raw_fires_df.alias("f").join(
+                clusters_df.alias("c"),
+                (F.col("f.latitude") >= (F.col("c.lat_min") - BUFFER_DEG)) &
+                (F.col("f.latitude") <= (F.col("c.lat_max") + BUFFER_DEG)) &
+                (F.col("f.longitude") >= (F.col("c.lon_min") - BUFFER_DEG)) &
+                (F.col("f.longitude") <= (F.col("c.lon_max") + BUFFER_DEG)),
+                "left"
+            )
+
+            enriched_fires = enriched_fires.withColumn(
+                "assigned_cluster_id",
+                F.coalesce(
+                    F.col("c.cluster_id"),
+                    F.concat(F.lit("INC_"), F.format_string("%.2f", F.col("f.latitude")), F.lit("_"), F.format_string("%.2f", F.col("f.longitude")))
+                )
+            )
+
+            # 3. Recalcular límites de clústeres
+            updated_clusters = enriched_fires.groupBy("assigned_cluster_id").agg(
+                F.min("latitude").alias("new_lat_min"),
+                F.max("latitude").alias("new_lat_max"),
+                F.min("longitude").alias("new_lon_min"),
+                F.max("longitude").alias("new_lon_max"),
+                F.min("fire_detection_timestamp").alias("new_first_seen"),
+                F.max("fire_detection_timestamp").alias("new_last_seen")
+            )
+
+            # 4. MERGE en 'silver_fire_clusters'
+            delta_clusters = DeltaTable.forName(self.spark, "silver_fire_clusters")
+            delta_clusters.alias("target").merge(
+                updated_clusters.alias("source"),
+                "target.cluster_id = source.assigned_cluster_id"
+            ).whenMatchedUpdate(set={
+                "lat_min": F.least(F.col("target.lat_min"), F.col("source.new_lat_min")),
+                "lat_max": F.greatest(F.col("target.lat_max"), F.col("source.new_lat_max")),
+                "lon_min": F.least(F.col("target.lon_min"), F.col("source.new_lon_min")),
+                "lon_max": F.greatest(F.col("target.lon_max"), F.col("source.new_lon_max")),
+                "last_detection_timestamp": F.greatest(F.col("target.last_detection_timestamp"), F.col("source.new_last_seen"))
+            }).whenNotMatchedInsert(values={
+                "cluster_id": "source.assigned_cluster_id",
+                "lat_min": "source.new_lat_min",
+                "lat_max": "source.new_lat_max",
+                "lon_min": "source.new_lon_min",
+                "lon_max": "source.new_lon_max",
+                "first_detection_timestamp": "source.new_first_seen",
+                "last_detection_timestamp": "source.new_last_seen"
+            }).execute()
+
+            # 5. Guardar 'silver_nasa_fires' enriquecida con cluster_id
+            final_nasa_fires = enriched_fires.select(
+                "latitude", "longitude", "acq_date", "acq_time", "fire_detection_timestamp",
+                "bright_ti4", "bright_ti5", "fire_radiative_power", "confidence", "daynight",
+                "landing_source_file", "ingestion_timestamp",
+                F.col("assigned_cluster_id").alias("cluster_id")
+            ).dropDuplicates(subset=["latitude", "longitude", "acq_date", "acq_time"])
+
+            final_nasa_fires.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("silver_nasa_fires")
+            logging.info("✅ Clústeres de incendios y 'silver_nasa_fires' sincronizados.")
+
+        except Exception as e:
+            logging.error(f"❌ Error en process_silver_fire_clusters: {e}")
             raise e
 
     def process_silver_dgt_traffic(self) -> None:
@@ -173,21 +275,16 @@ class SilverProcessor:
 
             dgt_filtered_df = self._filter_spain_with_buffer(silver_dgt_df)
 
-            # 1. Ejecutar MERGE incremental estándar para actualizar / insertar registros
+            # 1. MERGE incremental
             self._save_to_silver(dgt_filtered_df, "silver_dgt_traffic", ["record_id"])
 
-            # 2. Cierre automático de incidencias que han desaparecido del nuevo lote
+            # 2. Cierre automático de incidencias desaparecidas (Soft Delete)
             if not dgt_filtered_df.rdd.isEmpty() and self.spark.catalog.tableExists("silver_dgt_traffic"):
                 active_ids = [row.record_id for row in dgt_filtered_df.select("record_id").distinct().collect()]
-                
-                # Obtener la fecha de la ingestión del nuevo lote
                 latest_ingestion = dgt_filtered_df.select(F.max("ingestion_timestamp")).collect()[0][0]
 
                 if active_ids and latest_ingestion:
                     delta_table = DeltaTable.forName(self.spark, "silver_dgt_traffic")
-                    
-                    # Cierra (fija end_timestamp) en las incidencias de Silver que estaban sin cerrar
-                    # y que YA NO vienen en el listado de incidencias del nuevo fichero XML
                     delta_table.alias("target").update(
                         condition=(
                             F.col("target.end_timestamp").isNull() & 

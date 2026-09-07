@@ -95,7 +95,7 @@ class BronzeProcessor:
         try:
             df_raw = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
             
-            # Mantener objeto 'hourly' nativo (fidelidad de origen)
+            # Mantener objeto 'hourly' nativo
             df_bronze = df_raw.select(
                 F.col("latitude"),
                 F.col("longitude"),
@@ -105,6 +105,13 @@ class BronzeProcessor:
                 F.col("landing_source_file"),
                 F.col("ingestion_timestamp")
             )
+
+            # Auto-reparación si se detecta un esquema antiguo aplanado en la metastore
+            if self.spark.catalog.tableExists("bronze_weather"):
+                existing_cols = self.spark.table("bronze_weather").columns
+                if "hourly" not in existing_cols:
+                    logging.warning("⚠️ Detectado esquema antiguo en 'bronze_weather'. Recreando tabla...")
+                    self.spark.sql("DROP TABLE IF EXISTS bronze_weather")
 
             self.merge_into_bronze(df_bronze, "bronze_weather", ["latitude", "longitude"])
         except Exception as e:
