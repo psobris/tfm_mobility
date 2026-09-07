@@ -168,11 +168,38 @@ class SilverProcessor:
                 F.col("laneUsage").alias("lane_usage"),
                 F.col("vehicleType").alias("vehicle_type"),
                 F.col("landing_source_file"),
-                F.col("ingestion_timestamp")
+                F.to_timestamp(F.col("ingestion_timestamp")).alias("ingestion_timestamp")
             ).filter(F.col("record_id").isNotNull())
 
             dgt_filtered_df = self._filter_spain_with_buffer(silver_dgt_df)
+
+            # 1. Ejecutar MERGE incremental estándar para actualizar / insertar registros
             self._save_to_silver(dgt_filtered_df, "silver_dgt_traffic", ["record_id"])
+
+            # 2. Cierre automático de incidencias que han desaparecido del nuevo lote
+            if not dgt_filtered_df.rdd.isEmpty() and self.spark.catalog.tableExists("silver_dgt_traffic"):
+                active_ids = [row.record_id for row in dgt_filtered_df.select("record_id").distinct().collect()]
+                
+                # Obtener la fecha de la ingestión del nuevo lote
+                latest_ingestion = dgt_filtered_df.select(F.max("ingestion_timestamp")).collect()[0][0]
+
+                if active_ids and latest_ingestion:
+                    delta_table = DeltaTable.forName(self.spark, "silver_dgt_traffic")
+                    
+                    # Cierra (fija end_timestamp) en las incidencias de Silver que estaban sin cerrar
+                    # y que YA NO vienen en el listado de incidencias del nuevo fichero XML
+                    delta_table.alias("target").update(
+                        condition=(
+                            F.col("target.end_timestamp").isNull() & 
+                            (~F.col("target.record_id").isin(active_ids))
+                        ),
+                        set={
+                            "end_timestamp": F.lit(latest_ingestion),
+                            "updated_timestamp": F.current_timestamp()
+                        }
+                    )
+                    logging.info("✅ Cierre automático (Soft Delete) completado para incidencias DGT resueltas.")
+
         except Exception as e:
             logging.error(f"❌ Error procesando 'silver_dgt_traffic': {e}")
             raise e
