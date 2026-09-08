@@ -32,14 +32,6 @@ class SilverProcessor:
         - silver_fire_clusters
         - silver_dgt_traffic
         - silver_osm_roads
-
-    El clustering de incendios se realiza mediante:
-        1. Filtro geográfico de España con buffer
-        2. Deduplicación por coordenadas y ventana temporal
-        3. Creación de identificador SHA256 (fire_id)
-        4. Candidatos espaciales/temporales mediante celdas
-        5. Cálculo de distancia exacta Haversine (<= 5km) y diferencia de tiempo (<= 24h)
-        6. Agrupación exacta mediante DFS en Python (cero dependencias externas)
     """
 
     # ========================================================
@@ -59,7 +51,6 @@ class SilverProcessor:
     FIRE_CLUSTER_DISTANCE_KM = 5.0
     FIRE_CLUSTER_TIME_HOURS = 24
 
-    # Tamaño de celda espacial (1° latitud ≈ 111 km)
     SPATIAL_CELL_LAT_DEG = 0.05
     SPATIAL_CELL_LON_DEG = 0.07
 
@@ -726,7 +717,7 @@ class SilverProcessor:
             raise
 
     # ============================================================
-    # FIRE CLUSTERING - PYTHON PURO SIN LIBRERÍAS EXTERNAS
+    # FIRE CLUSTERING
     # ============================================================
 
     def _build_fire_clusters(
@@ -831,7 +822,6 @@ class SilverProcessor:
         all_fire_ids = [row["fire_id"] for row in nodes_df.select("fire_id").collect()]
         edges_list = candidate_edges.collect()
 
-        # Construcción de Lista de Adyacencia en Python Puro (cero dependencias de paquetes)
         adj: Dict[str, List[str]] = {fid: [] for fid in all_fire_ids}
         for row in edges_list:
             u, v = row["fire_id_a"], row["fire_id_b"]
@@ -841,7 +831,6 @@ class SilverProcessor:
         visited: Set[str] = set()
         mapping_data = []
 
-        # Algoritmo DFS (Depth-First Search)
         for fid in all_fire_ids:
             if fid not in visited:
                 component = []
@@ -1078,7 +1067,7 @@ class SilverProcessor:
             raise
 
     # ============================================================
-    # OSM ROADS
+    # OSM ROADS (CON APLANAMIENTO DE GEOMETRÍA EN CENTROIDE)
     # ============================================================
 
     def process_silver_osm_roads(self) -> None:
@@ -1088,6 +1077,12 @@ class SilverProcessor:
             logging.info(
                 "🛣️ Procesando silver_osm_roads..."
             )
+
+            if self.spark.catalog.tableExists("bronze_osm_roads"):
+                self.spark.catalog.refreshTable("bronze_osm_roads")
+            else:
+                logging.warning("⚠️ La tabla 'bronze_osm_roads' no existe en Bronze todavía. Omitiendo Silver OSM.")
+                return
 
             raw_df = self.spark.table(
                 "bronze_osm_roads"
@@ -1099,17 +1094,13 @@ class SilverProcessor:
             )
 
             if has_geom:
-
-                geom_col = F.col(
-                    "geometry_json"
-                )
-
+                geom_col = F.col("geometry_json")
+                centroid_lat = F.get_json_object(F.col("geometry_json"), "$[0].lat").cast(DoubleType())
+                centroid_lon = F.get_json_object(F.col("geometry_json"), "$[0].lon").cast(DoubleType())
             else:
-
-                geom_col = (
-                    F.lit(None)
-                    .cast("string")
-                )
+                geom_col = F.lit(None).cast("string")
+                centroid_lat = F.lit(None).cast(DoubleType())
+                centroid_lon = F.lit(None).cast(DoubleType())
 
             silver_roads_df = (
                 raw_df
@@ -1166,6 +1157,9 @@ class SilverProcessor:
                         "has_tunnel"
                     ),
 
+                    centroid_lat.alias("centroid_latitude"),
+                    centroid_lon.alias("centroid_longitude"),
+
                     geom_col.alias(
                         "road_geometry"
                     ),
@@ -1185,6 +1179,13 @@ class SilverProcessor:
                 )
             )
 
+            # Si existía una versión previa de silver_osm_roads sin centroid_latitude, la recreamos limpiamente
+            if self.spark.catalog.tableExists("silver_osm_roads"):
+                existing_cols = self.spark.table("silver_osm_roads").columns
+                if "centroid_latitude" not in existing_cols:
+                    logging.warning("⚠️ Detectado esquema antiguo sin centroid_latitude en silver_osm_roads. Recreando tabla...")
+                    self.spark.sql("DROP TABLE IF EXISTS silver_osm_roads")
+
             self._save_to_silver(
                 silver_roads_df,
                 "silver_osm_roads",
@@ -1192,7 +1193,7 @@ class SilverProcessor:
             )
 
             logging.info(
-                "✅ silver_osm_roads completado."
+                "✅ silver_osm_roads completado con geometría aplanada."
             )
 
         except Exception as e:
