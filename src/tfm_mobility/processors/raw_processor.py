@@ -6,6 +6,9 @@ from typing import Optional
 from datetime import datetime
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, StringType, LongType, IntegerType
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -161,26 +164,59 @@ class RawProcessor:
                 return
 
             now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            flattened_records = []
             file_name = os.path.basename(json_file)
+            
+            flattened_records = []
+            
             for elem in elements:
+                tags = elem.get("tags", {}) if isinstance(elem.get("tags"), dict) else {}
+                
+                # Esquema totalmente estandarizado y uniforme para Spark
                 record = {
-                    "id": elem.get("id"),
-                    "type": elem.get("type"),
+                    "id": int(elem.get("id")) if elem.get("id") is not None else None,
+                    "type": str(elem.get("type")) if elem.get("type") else "way",
+                    "nodes_count": len(elem.get("nodes", [])) if "nodes" in elem else 0,
+                    "tag_highway": str(tags.get("highway")) if tags.get("highway") else None,
+                    "tag_ref": str(tags.get("ref")) if tags.get("ref") else None,
+                    "tag_name": str(tags.get("name")) if tags.get("name") else None,
+                    "tag_maxspeed": str(tags.get("maxspeed")) if tags.get("maxspeed") else None,
+                    "tag_lanes": str(tags.get("lanes")) if tags.get("lanes") else None,
+                    "tag_oneway": str(tags.get("oneway")) if tags.get("oneway") else None,
+                    "tag_surface": str(tags.get("surface")) if tags.get("surface") else None,
+                    "tag_bridge": str(tags.get("bridge")) if tags.get("bridge") else None,
+                    "tag_tunnel": str(tags.get("tunnel")) if tags.get("tunnel") else None,
+                    "geometry_json": json.dumps(elem.get("geometry")) if "geometry" in elem else None,
                     "landing_source_file": file_name,
                     "ingestion_timestamp": now_str
                 }
-                tags = elem.get("tags", {})
-                if isinstance(tags, dict):
-                    for k, v in tags.items():
-                        record[f"tag_{k}"] = str(v)
                 
-                if "nodes" in elem:
-                    record["nodes_count"] = len(elem["nodes"])
                 flattened_records.append(record)
 
-            df = self.spark.createDataFrame(flattened_records)
+            # Esquema explícito para evitar inferencia errónea o columnas nulas en Parquet
+            osm_schema = StructType([
+                StructField("id", LongType(), True),
+                StructField("type", StringType(), True),
+                StructField("nodes_count", IntegerType(), True),
+                StructField("tag_highway", StringType(), True),
+                StructField("tag_ref", StringType(), True),
+                StructField("tag_name", StringType(), True),
+                StructField("tag_maxspeed", StringType(), True),
+                StructField("tag_lanes", StringType(), True),
+                StructField("tag_oneway", StringType(), True),
+                StructField("tag_surface", StringType(), True),
+                StructField("tag_bridge", StringType(), True),
+                StructField("tag_tunnel", StringType(), True),
+                StructField("geometry_json", StringType(), True),
+                StructField("landing_source_file", StringType(), True),
+                StructField("ingestion_timestamp", StringType(), True)
+            ])
+
+            df = self.spark.createDataFrame(flattened_records, schema=osm_schema)
+            
+            # Escribir Parquet limpio y estandarizado en RAW
             df.write.format("parquet").mode("overwrite").save(spark_raw)
-            logging.info(f"✅ OSM Red Viaria ({len(flattened_records)} tramos) guardada en RAW Parquet ({spark_raw}).")
+            logging.info(f"✅ OSM Red Viaria ({len(flattened_records)} tramos procesados) guardada en RAW Parquet ({spark_raw}).")
+            
         except Exception as e:
             logging.error(f"❌ Error procesando OSM Landing a RAW: {e}")
+            raise

@@ -54,7 +54,7 @@ def test_raw_processor_landing_to_raw_csv_batch(mock_spark):
         mock_df.write.format.return_value.mode.assert_called_once_with("overwrite")
 
 def test_raw_processor_landing_to_raw_osm(mock_spark):
-    """Verifica el procesamiento del JSON desanidado de OpenStreetMap (OSM)."""
+    """Verifica el procesamiento del JSON de OSM incluyendo la preservación de la geometría."""
     processor = RawProcessor(spark=mock_spark)
     
     mock_df = MagicMock()
@@ -66,7 +66,7 @@ def test_raw_processor_landing_to_raw_osm(mock_spark):
 
     mock_spark.createDataFrame.return_value = mock_df
 
-    mock_osm_data = '{"elements": [{"id": 101, "type": "way", "tags": {"highway": "motorway", "name": "A-6"}}]}'
+    mock_osm_data = '{"elements": [{"id": 101, "type": "way", "tags": {"highway": "motorway", "name": "A-6"}, "geometry": [{"lat": 40.41, "lon": -3.70}]}]}'
     
     with patch("os.path.isdir", return_value=False), \
          patch("builtins.open", mock_open(read_data=mock_osm_data)), \
@@ -76,7 +76,11 @@ def test_raw_processor_landing_to_raw_osm(mock_spark):
 
         processor.landing_to_raw_osm("Files/landing/batch/osm_roads/osm_roads.json", "Files/raw/batch/osm_roads")
         
-        mock_spark.createDataFrame.assert_called_once()
+        # Validar que createDataFrame recibió los registros estructurados con geometry_json
+        assert mock_spark.createDataFrame.called
+        records = mock_spark.createDataFrame.call_args[0][0]
+        assert len(records) == 1
+        assert "geometry_json" in records[0]
         mock_writer.format.assert_called_once_with("parquet")
 
 def test_raw_processor_landing_to_raw_dgt_xml_no_files(mock_spark):

@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 
 class BronzeProcessor:
-    """Procesador para la capa Bronze con sanitización de esquemas y Delta MERGE condicional."""
+    """Procesador para la capa Bronze con sanitización de esquemas y registro forzado en el catálogo Delta."""
 
     def __init__(self, spark: SparkSession):
         self.spark = spark
@@ -37,29 +37,42 @@ class BronzeProcessor:
             df = df.withColumnRenamed(old_col, new_col)
         return df
 
+    def _read_raw_data(self, clean_path: str) -> DataFrame:
+        """Lee datos Parquet estandarizados desde la capa RAW."""
+        try:
+            df = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
+            if df.take(1):
+                logging.info(f"✅ Leídos datos Parquet RAW desde: {clean_path}")
+                return df
+        except Exception as e:
+            logging.warning(f"⚠️ No se pudo leer Parquet en {clean_path}: {e}")
+            
+        return None
+
     def merge_into_bronze(self, raw_df: DataFrame, table_name: str, primary_keys: List[str]) -> None:
-        if raw_df is None or raw_df.rdd.isEmpty():
-            logging.warning(f"⚠️ El DataFrame para {table_name} está vacío. Cancelando MERGE.")
+        if raw_df is None or not raw_df.take(1):
+            logging.warning(f"⚠️ El DataFrame para '{table_name}' está vacío. Se omite la operación.")
             return
 
         raw_df = self._sanitize_column_names(raw_df)
+        
         sanitized_pks = [re.sub(r'_+', '_', re.sub(r'[{}:;()\s\t=/\\]', '_', pk)).strip('_') for pk in primary_keys]
-        sanitized_pks = [pk for pk in sanitized_pks if pk in raw_df.columns]
+        existing_pks = [pk for pk in sanitized_pks if pk in raw_df.columns]
 
-        if not sanitized_pks:
-            sanitized_pks = raw_df.columns[:2]
+        if not existing_pks:
+            existing_pks = [raw_df.columns[0]]
 
         if "ingestion_timestamp" in raw_df.columns:
-            dedup_raw_df = raw_df.orderBy(raw_df["ingestion_timestamp"].desc()).dropDuplicates(subset=sanitized_pks)
+            dedup_raw_df = raw_df.orderBy(raw_df["ingestion_timestamp"].desc()).dropDuplicates(subset=existing_pks)
         else:
-            dedup_raw_df = raw_df.dropDuplicates(subset=sanitized_pks)
+            dedup_raw_df = raw_df.dropDuplicates(subset=existing_pks)
 
         if self.spark.catalog.tableExists(table_name):
             delta_table = DeltaTable.forName(self.spark, table_name)
-            merge_condition = " AND ".join([f"target.{col} = source.{col}" for col in sanitized_pks])
+            merge_condition = " AND ".join([f"target.{col} = source.{col}" for col in existing_pks])
 
             meta_cols = {"landing_source_file", "ingestion_timestamp", "updated_source_file", "updated_timestamp"}
-            data_cols = [c for c in dedup_raw_df.columns if c not in sanitized_pks and c not in meta_cols]
+            data_cols = [c for c in dedup_raw_df.columns if c not in existing_pks and c not in meta_cols]
 
             update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in data_cols]) if data_cols else "1 = 0"
 
@@ -86,16 +99,19 @@ class BronzeProcessor:
                 "CAST(NULL AS TIMESTAMP) AS updated_timestamp"
             )
             initial_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(table_name)
-            logging.info(f"✨ Tabla Delta '{table_name}' creada por primera vez.")
+            logging.info(f"✨ Tabla Delta '{table_name}' creada e inscrita en el catálogo por primera vez.")
+
+        self.spark.catalog.refreshTable(table_name)
 
     def process_bronze_weather(self, raw_path: str = "Files/raw/realtime/weather") -> None:
         clean_path = self._resolve_fabric_path(raw_path)
-        logging.info(f"⚙️ Procesando 'bronze_weather' manteniendo estructura nativa desde: {clean_path}")
+        logging.info(f"⚙️ Procesando 'bronze_weather' desde: {clean_path}")
 
         try:
-            df_raw = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
-            
-            # Mantener objeto 'hourly' nativo
+            df_raw = self._read_raw_data(clean_path)
+            if df_raw is None or not df_raw.take(1):
+                return
+
             df_bronze = df_raw.select(
                 F.col("latitude"),
                 F.col("longitude"),
@@ -106,11 +122,9 @@ class BronzeProcessor:
                 F.col("ingestion_timestamp")
             )
 
-            # Auto-reparación si se detecta un esquema antiguo aplanado en la metastore
             if self.spark.catalog.tableExists("bronze_weather"):
                 existing_cols = self.spark.table("bronze_weather").columns
                 if "hourly" not in existing_cols:
-                    logging.warning("⚠️ Detectado esquema antiguo en 'bronze_weather'. Recreando tabla...")
                     self.spark.sql("DROP TABLE IF EXISTS bronze_weather")
 
             self.merge_into_bronze(df_bronze, "bronze_weather", ["latitude", "longitude"])
@@ -128,7 +142,7 @@ class BronzeProcessor:
         for raw_path, table_name, pk in sources:
             clean_path = self._resolve_fabric_path(raw_path)
             try:
-                raw_df = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
+                raw_df = self._read_raw_data(clean_path)
                 self.merge_into_bronze(raw_df, table_name, pk)
             except Exception as e:
                 logging.error(f"❌ Error procesando {table_name}: {e}")
@@ -136,13 +150,14 @@ class BronzeProcessor:
     def promote_batch_to_bronze(self) -> None:
         sources = [
             ("Files/raw/batch/nasa_historical", "bronze_nasa_historical", ["latitude", "longitude", "acq_date", "acq_time"]),
-            ("Files/raw/batch/osm_roads", "bronze_osm_roads", ["id"])
+            ("Files/raw/batch/osm_roads", "bronze_osm_roads", ["id"]),
+            ("Files/raw/batch/osm_places", "bronze_osm_places", ["id"])
         ]
 
         for raw_path, table_name, pk in sources:
             clean_path = self._resolve_fabric_path(raw_path)
             try:
-                raw_df = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
+                raw_df = self._read_raw_data(clean_path)
                 self.merge_into_bronze(raw_df, table_name, pk)
             except Exception as e:
                 logging.error(f"❌ Error procesando {table_name}: {e}")
