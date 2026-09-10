@@ -16,6 +16,7 @@ from delta.tables import DeltaTable
 # LOGGING
 # ============================================================
 
+#configuracion estandar para monitorizar las transformaciones complejas de la capa silver
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -60,6 +61,7 @@ class SilverProcessor:
 
     def __init__(self, spark: SparkSession):
 
+        #aqui ajusto la sesion de spark activando el auto merge y la ejecucion adaptativa para optimizar los joins espaciales
         self.spark = spark
 
         self.spark.conf.set(
@@ -93,6 +95,7 @@ class SilverProcessor:
         lon_col: str = "longitude"
     ) -> DataFrame:
 
+        #he programado este filtro para descartar datos que caigan fuera de la ventana geografica de españa
         return df.filter(
             F.col(lat_col).isNotNull()
             & F.col(lon_col).isNotNull()
@@ -110,6 +113,7 @@ class SilverProcessor:
         lon2
     ):
 
+        #aplicacion de la formula de haversine en pyspark para calcular la distancia geografica real entre dos puntos
         return (
             6371.0
             * 2.0
@@ -141,18 +145,20 @@ class SilverProcessor:
         primary_keys: List[str]
     ) -> None:
 
+        #verifico que el dataframe contenga registros antes de actualizar la capa silver
         if df is None:
             logging.warning(
-                f"⚠️ DataFrame '{table_name}' es None."
+                f"DataFrame '{table_name}' es None."
             )
             return
 
         if not df.take(1):
             logging.warning(
-                f"⚠️ DataFrame '{table_name}' está vacío."
+                f"DataFrame '{table_name}' esta vacio."
             )
             return
 
+        #aqui aplico una funcion de ventana para eliminar duplicados quedandome con la ultima marca de ingesta
         if "ingestion_timestamp" in df.columns:
 
             from pyspark.sql.window import Window
@@ -176,6 +182,7 @@ class SilverProcessor:
 
             dedup_df = df.dropDuplicates(primary_keys)
 
+        #estampado de los campos de trazabilidad para auditar cuando se modifico el dato
         source_df = (
             dedup_df
             .withColumn(
@@ -188,6 +195,7 @@ class SilverProcessor:
             )
         )
 
+        #si la tabla delta existe en el catalogo se realiza una operacion de merge condicional
         if self.spark.catalog.tableExists(table_name):
 
             delta_table = DeltaTable.forName(
@@ -215,11 +223,12 @@ class SilverProcessor:
             )
 
             logging.info(
-                f"✅ '{table_name}' actualizado mediante MERGE."
+                f"'{table_name}' actualizado mediante MERGE."
             )
 
         else:
 
+            #creacion inicial de la tabla delta si es la primera vez que se ejecuta la canalizacion
             (
                 source_df
                 .write
@@ -230,7 +239,7 @@ class SilverProcessor:
             )
 
             logging.info(
-                f"✨ '{table_name}' creada."
+                f"'{table_name}' creada."
             )
 
     # ============================================================
@@ -242,7 +251,7 @@ class SilverProcessor:
         try:
 
             logging.info(
-                "🌦️ Procesando silver_weather..."
+                "Procesando silver_weather..."
             )
 
             self.spark.catalog.refreshTable(
@@ -253,6 +262,7 @@ class SilverProcessor:
                 "bronze_weather"
             )
 
+            #he utilizado posexplode para desanidar los vectores de las predicciones meteorologicas manteniendo sincronizadas las posiciones
             exploded_df = (
                 raw_df
                 .select(
@@ -291,6 +301,7 @@ class SilverProcessor:
                         "forecast_timestamp"
                     ),
 
+                    #extraccion escalar sincronizada usando la posicion pos mas uno
                     F.element_at(
                         F.col("hourly.temperature_2m"),
                         F.col("pos") + 1
@@ -350,13 +361,13 @@ class SilverProcessor:
             )
 
             logging.info(
-                "✅ silver_weather completado."
+                "silver_weather completado."
             )
 
         except Exception as e:
 
             logging.error(
-                f"❌ Error en silver_weather: {e}"
+                f"Error en silver_weather: {e}"
             )
 
             raise
@@ -370,9 +381,10 @@ class SilverProcessor:
         try:
 
             logging.info(
-                "🔥 Procesando silver_nasa_fires..."
+                "Procesando silver_nasa_fires..."
             )
 
+            #he construido esta union combinando el historico de 7 dias con los datos nrt de tiempo real
             dfs_to_union = []
 
             if self.spark.catalog.tableExists(
@@ -396,7 +408,7 @@ class SilverProcessor:
             if not dfs_to_union:
 
                 logging.warning(
-                    "⚠️ No existen tablas Bronze NASA."
+                    "No existen tablas Bronze NASA."
                 )
 
                 return
@@ -410,6 +422,7 @@ class SilverProcessor:
                     allowMissingColumns=True
                 )
 
+            #aqui formateo la hora rellenando con ceros a la izquierda para poder construir una marca de tiempo valida
             formatted_time = F.lpad(
                 F.col("acq_time").cast("string"),
                 4,
@@ -478,6 +491,7 @@ class SilverProcessor:
                 )
             )
 
+            #deduplicacion mediante funciones de ventana para eliminar alertas duplicadas en pasadas de satelite
             from pyspark.sql.window import Window
 
             window_spec = (
@@ -528,6 +542,7 @@ class SilverProcessor:
                 )
             )
 
+            #persisto el dataframe en memoria y disco para agilizar la ejecucion del clustering posterior
             fires = fires.persist(
                 StorageLevel.MEMORY_AND_DISK
             )
@@ -535,13 +550,14 @@ class SilverProcessor:
             if not fires.take(1):
 
                 logging.warning(
-                    "⚠️ No hay detecciones NASA válidas."
+                    "No hay detecciones NASA validas."
                 )
 
                 fires.unpersist()
 
                 return
 
+            #aqui invoco la funcion que resuelve el agrupamiento espacial y temporal de los focos de fuego
             cluster_mapping = (
                 self._build_fire_clusters(
                     fires
@@ -607,9 +623,10 @@ class SilverProcessor:
             )
 
             logging.info(
-                "✅ silver_nasa_fires creada/actualizada."
+                "silver_nasa_fires creada/actualizada."
             )
 
+            #se genera un resumen a nivel de cluster agregando estadisticas de potencia y centroides
             cluster_summary = (
                 enriched_fires
                 .groupBy(
@@ -705,13 +722,13 @@ class SilverProcessor:
             fires.unpersist()
 
             logging.info(
-                "🔥 Clustering y silver_fire_clusters completados."
+                "Clustering y silver_fire_clusters completados."
             )
 
         except Exception as e:
 
             logging.error(
-                f"❌ Error en silver_nasa_fires: {e}"
+                f"Error en silver_nasa_fires: {e}"
             )
 
             raise
@@ -725,8 +742,9 @@ class SilverProcessor:
         fires: DataFrame
     ) -> DataFrame:
 
-        logging.info("🔥 Construyendo clusters de incendios...")
+        logging.info("Construyendo clusters de incendios...")
 
+        #se asigna cada deteccion a celdas temporales y espaciales fijas para acotar las comparaciones
         nodes_df = (
             fires
             .select("fire_id", "latitude", "longitude", "fire_detection_timestamp")
@@ -748,6 +766,7 @@ class SilverProcessor:
             )
         )
 
+        #definicion de los 27 desplazamientos adyacentes para evaluar unicamente las celdas colindantes
         offsets = [
             (-1, -1, -1), (-1, -1, 0), (-1, -1, 1),
             (-1, 0, -1),  (-1, 0, 0),  (-1, 0, 1),
@@ -765,6 +784,7 @@ class SilverProcessor:
             ["_lat_offset", "_lon_offset", "_time_offset"]
         )
 
+        #se cruzan los candidatos utilizando broadcast para no saturar la red del cluster
         candidates = (
             nodes_df
             .crossJoin(F.broadcast(offsets_df))
@@ -793,6 +813,7 @@ class SilverProcessor:
             F.col("_join_time_bucket").alias("join_time_bucket")
         )
 
+        #se calcula la distancia de haversine y la diferencia de tiempo sobre los candidatos filtrados
         candidate_edges = (
             a.join(
                 b,
@@ -817,8 +838,9 @@ class SilverProcessor:
             .dropDuplicates(["fire_id_a", "fire_id_b"])
         )
 
-        logging.info("🔗 Obteniendo lista de conexiones de incendios...")
+        logging.info("Obteniendo lista de conexiones de incendios...")
 
+        #extraigo la lista reducida de aristas al driver para resolver las componentes conexas en memoria local
         all_fire_ids = [row["fire_id"] for row in nodes_df.select("fire_id").collect()]
         edges_list = candidate_edges.collect()
 
@@ -831,6 +853,7 @@ class SilverProcessor:
         visited: Set[str] = set()
         mapping_data = []
 
+        #algoritmo de busqueda en profundidad para asignar un cluster_id unico a cada componente conectada
         for fid in all_fire_ids:
             if fid not in visited:
                 component = []
@@ -849,12 +872,13 @@ class SilverProcessor:
                 for item in component:
                     mapping_data.append((item, cluster_id))
 
+        #he reconvertido el mapeo de clusters a dataframe de spark para unirlo con las detecciones originales
         cluster_mapping = self.spark.createDataFrame(
             mapping_data,
             ["fire_id", "cluster_id"]
         )
 
-        logging.info("✅ Clusters de incendios generados correctamente.")
+        logging.info("Clusters de incendios generados correctamente.")
 
         return cluster_mapping
 
@@ -867,13 +891,14 @@ class SilverProcessor:
         try:
 
             logging.info(
-                "🚗 Procesando silver_dgt_traffic..."
+                "Procesando silver_dgt_traffic..."
             )
 
             raw_df = self.spark.table(
                 "bronze_dgt_traffic"
             )
 
+            #aqui selecciono y normalizo los campos de las incidencias de trafico de la dgt
             silver_dgt_df = (
                 raw_df
                 .select(
@@ -987,6 +1012,7 @@ class SilverProcessor:
                 ["record_id"]
             )
 
+            #he implementado este bloque para cerrar el ciclo de vida marcando end_timestamp cuando una incidencia deja de aparecer en las ingestas
             if self.spark.catalog.tableExists(
                 "silver_dgt_traffic"
             ):
@@ -1018,6 +1044,7 @@ class SilverProcessor:
                         "silver_dgt_traffic"
                     )
 
+                    #aqui utilizo whennotmatchedbysourceupdate para marcar como finalizada la incidencia si ya no viene en el feed
                     (
                         delta_table
                         .alias("target")
@@ -1055,13 +1082,13 @@ class SilverProcessor:
                     )
 
             logging.info(
-                "✅ silver_dgt_traffic completado."
+                "silver_dgt_traffic completado."
             )
 
         except Exception as e:
 
             logging.error(
-                f"❌ Error en silver_dgt_traffic: {e}"
+                f"Error en silver_dgt_traffic: {e}"
             )
 
             raise
@@ -1075,13 +1102,13 @@ class SilverProcessor:
         try:
 
             logging.info(
-                "🛣️ Procesando silver_osm_roads..."
+                "Procesando silver_osm_roads..."
             )
 
             if self.spark.catalog.tableExists("bronze_osm_roads"):
                 self.spark.catalog.refreshTable("bronze_osm_roads")
             else:
-                logging.warning("⚠️ La tabla 'bronze_osm_roads' no existe en Bronze todavía. Omitiendo Silver OSM.")
+                logging.warning("La tabla 'bronze_osm_roads' no existe en Bronze todavia. Omitiendo Silver OSM.")
                 return
 
             raw_df = self.spark.table(
@@ -1093,6 +1120,7 @@ class SilverProcessor:
                 in raw_df.columns
             )
 
+            #extraigo las coordenadas escalares del primer punto de la linea usando get_json_object para simplificar consultas
             if has_geom:
                 geom_col = F.col("geometry_json")
                 centroid_lat = F.get_json_object(F.col("geometry_json"), "$[0].lat").cast(DoubleType())
@@ -1179,11 +1207,11 @@ class SilverProcessor:
                 )
             )
 
-            # Si existía una versión previa de silver_osm_roads sin centroid_latitude, la recreamos limpiamente
+            #si detecto una tabla desactualizada sin la columna centroid_latitude la recreo de forma limpia
             if self.spark.catalog.tableExists("silver_osm_roads"):
                 existing_cols = self.spark.table("silver_osm_roads").columns
                 if "centroid_latitude" not in existing_cols:
-                    logging.warning("⚠️ Detectado esquema antiguo sin centroid_latitude en silver_osm_roads. Recreando tabla...")
+                    logging.warning("Detectado esquema antiguo sin centroid_latitude en silver_osm_roads. Recreando tabla...")
                     self.spark.sql("DROP TABLE IF EXISTS silver_osm_roads")
 
             self._save_to_silver(
@@ -1193,13 +1221,13 @@ class SilverProcessor:
             )
 
             logging.info(
-                "✅ silver_osm_roads completado con geometría aplanada."
+                "silver_osm_roads completado con geometria aplanada."
             )
 
         except Exception as e:
 
             logging.error(
-                f"❌ Error en silver_osm_roads: {e}"
+                f"Error en silver_osm_roads: {e}"
             )
 
             raise
@@ -1210,8 +1238,9 @@ class SilverProcessor:
 
     def run_all_silver_pipeline(self) -> None:
 
+        #metodo de orquestacion principal para ejecutar la transformacion completa de la capa silver
         logging.info(
-            "🚀 [SILVER] Iniciando pipeline..."
+            "[SILVER] Iniciando pipeline..."
         )
 
         try:
@@ -1226,7 +1255,7 @@ class SilverProcessor:
             )
 
             logging.info(
-                "✅ [SILVER OK] Pipeline finalizado."
+                "[SILVER OK] Pipeline finalizado."
             )
 
             logging.info(
@@ -1240,7 +1269,7 @@ class SilverProcessor:
             )
 
             logging.error(
-                f"❌ [SILVER ERROR] {e}"
+                f"[SILVER ERROR] {e}"
             )
 
             logging.error(

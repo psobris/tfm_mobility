@@ -10,6 +10,7 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, IntegerType
 )
 
+#limpio el formato del logger para registrar todo el proceso de promocion a la capa raw
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
@@ -17,9 +18,11 @@ class RawProcessor:
     """Procesador para la capa RAW promocionando datos de Landing a Parquet de forma incremental."""
 
     def __init__(self, spark: SparkSession):
+        #inicializacion del procesador guardando la sesion activa de spark
         self.spark = spark
 
     def _clean_spark_path(self, path: str) -> str:
+        #he construido este metodo para estandarizar las rutas que entiende spark en el entorno de fabric
         if not path:
             return ""
         clean = os.path.normpath(path).replace("\\", "/")
@@ -31,6 +34,7 @@ class RawProcessor:
         return clean
 
     def _clean_local_path(self, path: str) -> str:
+        #se ajusta la ruta fisica local necesaria para las operaciones del sistema de archivos con python puro
         if not path:
             return ""
         clean = os.path.normpath(path).replace("\\", "/")
@@ -41,34 +45,40 @@ class RawProcessor:
         return clean
 
     def landing_to_raw_json(self, landing_path: str, raw_path: Optional[str] = None, is_batch: bool = False) -> None:
+        #aqui limpio las rutas origen y destino para procesar archivos json procedentes de la capa landing
         spark_raw = self._clean_spark_path(raw_path or ("Files/raw/batch/osm_roads" if is_batch else "Files/raw/realtime/weather"))
         spark_landing = self._clean_spark_path(landing_path)
 
-        logging.info(f"📄 Leyendo JSONs desde Landing (recursivo): {spark_landing}")
+        logging.info(f"Leyendo JSONs desde Landing (recursivo): {spark_landing}")
         try:
+            #lectura recursiva de los ficheros json utilizando la capacidad distribuida de spark
             df = self.spark.read \
                 .option("recursiveFileLookup", "true") \
                 .option("multiline", "true") \
                 .json(spark_landing)
 
             if df.count() > 0:
+                #he añadido los metadatos de auditoria del fichero de origen y la fecha exacta de ingesta
                 now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
                 df = df.withColumn("landing_source_file", F.col("_metadata.file_name").cast("string")) \
                        .withColumn("ingestion_timestamp", F.lit(now_str).cast("string"))
                 
+                #persistencia en formato parquet columnar aplicando la estrategia overwrite o append segun sea batch o nrt
                 df.write.format("parquet").mode("overwrite" if is_batch else "append").save(spark_raw)
-                logging.info(f"✅ JSON guardado correctamente en Parquet RAW: {spark_raw}")
+                logging.info(f"JSON guardado correctamente en Parquet RAW: {spark_raw}")
             else:
-                logging.warning(f"⚠️ Sin datos JSON en ruta: {spark_landing}")
+                logging.warning(f"Sin datos JSON en ruta: {spark_landing}")
         except Exception as e:
-            logging.error(f"❌ Error procesando JSON Landing ({landing_path}): {e}")
+            logging.error(f"Error procesando JSON Landing ({landing_path}): {e}")
 
     def landing_to_raw_csv(self, landing_path: str, raw_path: Optional[str] = None, is_batch: bool = False) -> None:
+        #preparacion de rutas para la promocion de ficheros csv de la nasa hacia la zona raw
         spark_raw = self._clean_spark_path(raw_path or ("Files/raw/batch/nasa_historical" if is_batch else "Files/raw/realtime/nasa_nrt"))
         spark_landing = self._clean_spark_path(landing_path)
         
-        logging.info(f"📄 Leyendo CSV Landing: {spark_landing}")
+        logging.info(f"Leyendo CSV Landing: {spark_landing}")
         try:
+            #se realiza la lectura de los csv infiriendo el esquema e identificando cabeceras
             df = self.spark.read \
                 .option("recursiveFileLookup", "true") \
                 .option("header", "true") \
@@ -76,20 +86,23 @@ class RawProcessor:
                 .csv(spark_landing)
                 
             if df.count() > 0:
+                #estampado de campos de trazabilidad para auditar la procedencia del dato
                 now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
                 df = df.withColumn("landing_source_file", F.col("_metadata.file_name").cast("string")) \
                        .withColumn("ingestion_timestamp", F.lit(now_str).cast("string"))
                 df.write.format("parquet").mode("overwrite" if is_batch else "append").save(spark_raw)
-                logging.info(f"✅ CSV guardado en Parquet RAW: {spark_raw}")
+                logging.info(f"CSV guardado en Parquet RAW: {spark_raw}")
             else:
-                logging.warning(f"⚠️ Sin datos CSV en: {spark_landing}")
+                logging.warning(f"Sin datos CSV en: {spark_landing}")
         except Exception as e:
-            logging.error(f"❌ Error procesando CSV Landing ({landing_path}): {e}")
+            logging.error(f"Error procesando CSV Landing ({landing_path}): {e}")
 
     def landing_to_raw_dgt_xml(self, landing_path: str, raw_path: Optional[str] = None) -> None:
+        #construccion de rutas locales para procesar la estructura xml compleja de la dgt
         spark_raw = self._clean_spark_path(raw_path or "Files/raw/realtime/dgt_traffic")
         local_base = self._clean_local_path(landing_path)
         
+        #recorrido del directorio para recuperar todos los archivos xml almacenados en landing
         xml_files = []
         if os.path.isfile(local_base):
             xml_files.append(local_base)
@@ -100,17 +113,19 @@ class RawProcessor:
                         xml_files.append(os.path.join(root, f))
 
         if not xml_files:
-            logging.warning(f"⚠️ No se encontraron XMLs de DGT en: {local_base}")
+            logging.warning(f"No se encontraron XMLs de DGT en: {local_base}")
             return
 
         records = []
         now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        #he desarrollado este parser nativo con elementtree para desanidar el formato datex ii sin perder informacion
         for xml_file in xml_files:
             file_name = os.path.basename(xml_file)
             try:
                 tree = ET.parse(xml_file)
                 root = tree.getroot()
 
+                #extraigo los nodos de incidencias eliminando los namespaces dinámicos de los tags
                 for elem in root.iter():
                     tag_name = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
                     if tag_name in ["situationRecord", "situationRecordExtension"]:
@@ -119,6 +134,7 @@ class RawProcessor:
                             "landing_source_file": file_name,
                             "ingestion_timestamp": now_str
                         }
+                        #aplanamiento de las etiquetas hijas a un diccionario unificado
                         for child in elem.iter():
                             child_tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
                             if child.text and child.text.strip():
@@ -127,16 +143,18 @@ class RawProcessor:
                         if len(row) > 3:
                             records.append(row)
             except Exception as e:
-                logging.error(f"⚠️ Error parseando XML {xml_file}: {e}")
+                logging.error(f"Error parseando XML {xml_file}: {e}")
 
+        #conversion de la lista de diccionarios planos a dataframe de spark y guardado en parquet
         if records:
             df = self.spark.createDataFrame(records)
             df.write.format("parquet").mode("overwrite").save(spark_raw)
-            logging.info(f"✅ XML DGT ({len(records)} registros) guardado en Parquet RAW.")
+            logging.info(f"DGT ({len(records)} registros) guardado en Parquet RAW")
         else:
-            logging.warning("⚠️ XML DGT sin registros válidos.")
+            logging.warning("DGT sin registros validos")
 
     def landing_to_raw_osm(self, landing_path: str, raw_path: Optional[str] = None) -> None:
+        #aqui resuelvo la ruta del fichero json de openstreetmap buscando el archivo mas reciente
         spark_raw = self._clean_spark_path(raw_path or "Files/raw/batch/osm_roads")
         local_landing = self._clean_local_path(landing_path)
         
@@ -147,20 +165,21 @@ class RawProcessor:
                     if f.endswith(".json"):
                         json_files.append(os.path.join(root, f))
             if not json_files:
-                logging.warning(f"⚠️ No se encontraron JSONs de OSM en: {landing_path}")
+                logging.warning(f"No se encontraron JSONs de OSM en: {landing_path}")
                 return
             json_file = max(json_files, key=os.path.getmtime)
         else:
             json_file = local_landing
 
-        logging.info(f"📄 Procesando JSON OSM desde: {json_file}")
+        logging.info(f"Procesando OSM desde: {json_file}")
         try:
+            #lectura del json crudo recuperando el vector principal de elementos de la infraestructura viaria
             with open(json_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
             elements = data.get("elements", [])
             if not elements:
-                logging.warning("⚠️ El JSON de OSM no contiene la clave 'elements'.")
+                logging.warning("El JSON de OSM no contiene la clave 'elements'.")
                 return
 
             now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -168,10 +187,11 @@ class RawProcessor:
             
             flattened_records = []
             
+            #he filtrado y aplanado las etiquetas variables de osm hacia un subconjunto estricto de columnas
             for elem in elements:
                 tags = elem.get("tags", {}) if isinstance(elem.get("tags"), dict) else {}
                 
-                # Esquema totalmente estandarizado y uniforme para Spark
+                #construccion del registro plano para evitar esquemas dispersos con nulos
                 record = {
                     "id": int(elem.get("id")) if elem.get("id") is not None else None,
                     "type": str(elem.get("type")) if elem.get("type") else "way",
@@ -192,7 +212,7 @@ class RawProcessor:
                 
                 flattened_records.append(record)
 
-            # Esquema explícito para evitar inferencia errónea o columnas nulas en Parquet
+            #aqui defino un structtype explicito garantizando la estabilidad de la tabla parquet resultante
             osm_schema = StructType([
                 StructField("id", LongType(), True),
                 StructField("type", StringType(), True),
@@ -211,12 +231,12 @@ class RawProcessor:
                 StructField("ingestion_timestamp", StringType(), True)
             ])
 
+            #creacion del dataframe con el esquema tipado y persistencia en la zona raw
             df = self.spark.createDataFrame(flattened_records, schema=osm_schema)
             
-            # Escribir Parquet limpio y estandarizado en RAW
             df.write.format("parquet").mode("overwrite").save(spark_raw)
             logging.info(f"✅ OSM Red Viaria ({len(flattened_records)} tramos procesados) guardada en RAW Parquet ({spark_raw}).")
             
         except Exception as e:
-            logging.error(f"❌ Error procesando OSM Landing a RAW: {e}")
+            logging.error(f"Error procesando OSM Landing a RAW: {e}")
             raise

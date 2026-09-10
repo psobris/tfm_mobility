@@ -1,3 +1,5 @@
+import os
+import requests
 from unittest.mock import MagicMock, patch
 import pytest
 from tfm_mobility.ingesters.osm_ingester import OSMIngester
@@ -5,13 +7,13 @@ from tfm_mobility.ingesters.osm_ingester import OSMIngester
 
 @pytest.fixture
 def osm_ingester(tmp_path):
-    """Fixture que proporciona una instancia de OSMIngester con ruta temporal."""
+    #fixture que proporciona una instancia de osmingester con ruta temporal
     return OSMIngester(landing_base_path=str(tmp_path))
 
 
 @pytest.fixture
 def mock_response_ok():
-    """Fixture que simula una respuesta HTTP exitosa de Overpass."""
+    #fixture que simula una respuesta http exitosa de overpass
     mock_resp = MagicMock()
     mock_resp.raise_for_status.return_value = None
     mock_resp.json.return_value = {
@@ -30,10 +32,7 @@ def mock_response_ok():
 
 
 def test_build_query_contains_expected_highways(osm_ingester):
-    """
-    Verifica que la consulta Overpass incluye las principales
-    categorías de carreteras utilizadas por el proyecto.
-    """
+    #compruebo que la consulta overpass incluye las categorias de carreteras requeridas
     query = osm_ingester._build_query()
 
     assert "motorway" in query
@@ -41,7 +40,7 @@ def test_build_query_contains_expected_highways(osm_ingester):
     assert "motorway_link" in query
     assert "trunk_link" in query
 
-    # Compatibilidad con salida ordenada o sin ordenar (qt)
+    #compatibilidad con salida ordenada o sin ordenar
     assert "out qt body geom;" in query or "out body geom;" in query
 
 
@@ -49,10 +48,7 @@ def test_fetch_roads_sends_expected_request(
     osm_ingester,
     mock_response_ok,
 ):
-    """
-    Verifica que la petición a Overpass utiliza POST y contiene
-    la query esperada y User-Agent.
-    """
+    #se valida que la peticion a overpass utiliza post y contiene las cabeceras y configuraciones necesarias
     with patch(
         "requests.post",
         return_value=mock_response_ok,
@@ -79,3 +75,22 @@ def test_fetch_roads_sends_expected_request(
     assert "motorway" in query
     assert "trunk" in query
     assert "out qt body geom;" in query or "out body geom;" in query
+
+
+def test_save_to_landing(osm_ingester):
+    #test para comprobar la persistencia correcta del json descargado en la zona landing
+    fake_data = {"elements": [{"id": 1, "type": "way"}]}
+    output_path = osm_ingester.save_to_landing(fake_data)
+
+    #verificacion de la existencia del archivo guardado en el sistema de ficheros
+    assert output_path is not None
+    assert os.path.exists(output_path)
+    assert "osm_roads_" in output_path
+
+
+def test_fetch_roads_exhaust_endpoints_raises_runtime_error(osm_ingester):
+    #se verifica que ante la caida continuada de todos los endpoints el ingester lance un runtimeerror
+    with patch("requests.post", side_effect=requests.RequestException("Error de conexion")), \
+         patch("time.sleep", return_value=None):
+        with pytest.raises(RuntimeError):
+            osm_ingester.fetch_roads()
