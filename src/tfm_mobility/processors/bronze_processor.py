@@ -47,17 +47,17 @@ class BronzeProcessor:
         try:
             df = self.spark.read.option("recursiveFileLookup", "true").parquet(clean_path)
             if df.take(1):
-                logging.info(f"✅ Leídos datos Parquet RAW desde: {clean_path}")
+                logging.info(f"Leídos datos Parquet RAW desde: {clean_path}")
                 return df
         except Exception as e:
-            logging.warning(f"⚠️ No se pudo leer Parquet en {clean_path}: {e}")
+            logging.warning(f"No se pudo leer Parquet en {clean_path}: {e}")
             
         return None
 
     def merge_into_bronze(self, raw_df: DataFrame, table_name: str, primary_keys: List[str]) -> None:
         #validacion basica para no ejecutar la operacion si el dataframe origen no trae registros
         if raw_df is None or not raw_df.take(1):
-            logging.warning(f"⚠️ El DataFrame para '{table_name}' está vacío. Se omite la operación.")
+            logging.warning(f"El DataFrame para '{table_name}' está vacío. Se omite la operación.")
             return
 
         #limpieza de columnas y preparacion de las claves primarias para el cruce
@@ -102,7 +102,7 @@ class BronzeProcessor:
                 .whenMatchedUpdate(condition=update_condition, set=update_values) \
                 .whenNotMatchedInsert(values=insert_values) \
                 .execute()
-            logging.info(f"✅ MERGE condicional completado en '{table_name}'.")
+            logging.info(f"MERGE condicional completado en '{table_name}'.")
         else:
             #si es la primera ejecucion he programado la creacion inicial de la tabla delta
             initial_df = dedup_raw_df.selectExpr(
@@ -118,7 +118,7 @@ class BronzeProcessor:
     def process_bronze_weather(self, raw_path: str = "Files/raw/realtime/weather") -> None:
         #proceso especifico para la tabla meteorologica seleccionando los atributos del json anidado
         clean_path = self._resolve_fabric_path(raw_path)
-        logging.info(f"⚙️ Procesando 'bronze_weather' desde: {clean_path}")
+        logging.info(f"Procesando 'bronze_weather' desde: {clean_path}")
 
         try:
             df_raw = self._read_raw_data(clean_path)

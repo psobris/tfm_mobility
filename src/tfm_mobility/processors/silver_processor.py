@@ -1255,7 +1255,7 @@ class SilverProcessor:
             )
 
             logging.info(
-                "[SILVER OK] Pipeline finalizado."
+                "Pipeline finalizado."
             )
 
             logging.info(
